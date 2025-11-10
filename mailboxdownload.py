@@ -1,10 +1,9 @@
 import argparse
 import base64
 import importlib.util
+import json
 import logging.config
 import os
-import os
-import sys
 
 from configparser import ConfigParser
 from pprint import pprint
@@ -13,130 +12,63 @@ import msal
 import requests
 
 from msal import ConfidentialClientApplication
-from schema import GraphMessageSchema
 
 APPNAME = 'mailboxdownload'
+FILEATTACHMENT_TYPE = '#microsoft.graph.fileAttachment'
 
 logger = logging.getLogger(APPNAME)
 
-class GraphSource:
+def unique_for_exists(path):
+    test = path
+    i = 0
+    while os.path.exists(test):
+        root, ext = os.path.splitext(path)
+        test = f'{root}.{i}{ext}'
+        i += 1
+    return test
 
-    endpoint_string = 'https://graph.microsoft.com/v1.0/users/{username}/messages'
+def messages_url(mailbox):
+    return f"https://graph.microsoft.com/v1.0/users/{mailbox}/mailFolders('Inbox')/messages"
 
-    authority_string = 'https://login.microsoftonline.com/{tenant_id}'
+def attachments_url(mailbox, message):
+    message_id = message['id']
+    return f"https://graph.microsoft.com/v1.0/users/{mailbox}/messages/{message_id}/attachments"
 
-    def __init__(
-        self,
-        *, # keyword arguments only
-        tenant_id,
-        client_id,
-        secret,
-        scopes,
-        username,
-        password,
-        schema = None,
-        select = None,
-        **options,
-    ):
-        self.tenant_id = tenant_id
-        self.client_id = client_id
-        self.secret = secret
-        self.scopes = scopes
-        self.username = username
-        self.password = password
-        if schema is None:
-            schema = GraphMessageSchema()
-        self.schema = schema
-        self.options = options
+def iter_messages(mailbox, headers):
+    url = messages_url(mailbox)
+    while url:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        for msg in data.get('value', []):
+            yield msg
+        url = data.get('@odata.nextLink')
 
-    @property
-    def authority(self):
-        return self.authority_string.format(tenant_id=self.tenant_id)
+def iter_attachments(mailbox, message, headers):
+    attach_url = attachments_url(mailbox, message)
+    attach_resp = requests.get(attach_url, headers=headers)
+    attach_resp.raise_for_status()
+    attachments = attach_resp.json().get('value', [])
+    yield from attachments
 
-    @property
-    def endpoint(self):
-        context = {
-            'username': self.username,
-        }
-        return self.endpoint_string.format(**context)
+def ensure_log_dirs():
+    for logger_name in logging.root.manager.loggerDict:
+        logger = logging.getLogger(logger_name)
+        for handler in logger.handlers:
+            if hasattr(handler, 'baseFilename'):
+                directory = os.path.dirname(handler.baseFilename)
+                os.makedirs(directory, exist_ok=True)
 
-    def itermessages(self):
-        app = msal.ConfidentialClientApplication(
-            client_id = self.client_id,
-            authority = self.authority,
-            client_credential = self.secret,
-        )
-        # NOTE: in practice, the checks and loops over in hello_graph_api
-        #       always go to username/password.
-        token_result = app.acquire_token_by_username_password(
-            self.username, self.password, scopes=self.scopes,
-        )
-        access_token = token_result['access_token']
-        # accumulate messages until no nextLink
-        headers = {'Authorization': f'Bearer {access_token}'}
-        endpoint = self.endpoint
-        while True:
-            response = requests.get(endpoint, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            messages = data['value']
-            if self.schema:
-                messages = self.schema.load(messages, many=True)
-            yield from messages
-            if '@odata.nextLink' not in data:
-                break
-            endpoint = data['@odata.nextLink']
+def ensure_dir_for(path):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+    return path
 
-
-class MailboxDownload:
-
-    def __init__(
-        self,
-        *,
-        source,
-        dest,
-    ):
-        self.source = source
-        self.dest = dest
-
-
-def load_module_from_path(path, module_name = None):
-    """
-    Dynamically load a Python file as a module, like Flask does with config .py files.
-
-    Args:
-        path (str): Path to the Python file to load.
-        module_name (str | None): Optional name to assign to the loaded module.
-                                  Defaults to basename of the file (without extension).
-    """
-    path = os.path.abspath(path)
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-
-    if module_name is None:
-        module_name = os.path.splitext(os.path.basename(path))[0]
-
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load module from {path}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('config')
-    parser.add_argument('--debug')
-    args = parser.parse_args(argv)
-
-    cp = ConfigParser()
-    cp.read(args.config)
-
+def realmain(cp):
     appconf = cp[APPNAME]
 
+    filename = appconf.get('filename', '{message[subject]} - {attachment[name]}')
+    archive_path = appconf['message_archive']
     mailbox = appconf['mailbox']
     tenant_id = appconf['tenant_id']
     client_id = appconf['client_id']
@@ -144,28 +76,98 @@ def main(argv=None):
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     scope = ["https://graph.microsoft.com/.default"]
 
+    # Ensure directories exists
+
+    if os.path.exists(archive_path):
+        with open(archive_path, 'r') as archive_file:
+            archive = json.load(archive_file)
+    else:
+        logger.info('archive %s not found using empty list', archive_path)
+        archive = list()
+
     app = ConfidentialClientApplication(
         client_id,
         authority = authority,
         client_credential = client_secret
     )
 
-    message_schema = GraphMessageSchema()
-
     result = app.acquire_token_for_client(scopes=scope)
-    if "access_token" not in result:
-        raise Exception(f"Failed to get token: {result.get('error_description')}")
+    if 'access_token' not in result:
+        raise KeyError(f"Failed to get token: {result.get('error_description')}")
 
     # Emails sent daily at 1800 ET
     token = result["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/mailFolders('Inbox')/messages"
-    resp = requests.get(url, headers=headers)
-    messages = resp.json()
-    for message in messages['value']:
-        message = message_schema.load(message)
-        pprint(message)
-    breakpoint()
+
+    for message in iter_messages(mailbox, headers):
+        message_id = message['id']
+        if not message.get('hasAttachments'):
+            logger.info('skip no-attachments message: %s', message['id'])
+            continue
+
+        attachments = iter_attachments(mailbox, message, headers)
+        for attachment_index, attachment in enumerate(attachments):
+            attachment_name = attachment.get('name')
+
+            # Check message, attachment pair already seen.
+            if any(
+                arch['message_id'] == message_id
+                and
+                arch['attachment_name'] == attachment_name
+                for arch in archive
+            ):
+                logger.info('skip attachment %s for message: %s',
+                            attachment_name, message_id)
+                continue
+
+            # Format string for download filename
+            context = {
+                'message': message,
+                'attachment': attachment,
+            }
+            path = unique_for_exists(os.path.normpath(filename.format(**context)))
+            logger.info('read message id: %s, attachment: %s', message['id'], path)
+            if attachment.get('@odata.type') == FILEATTACHMENT_TYPE:
+                content_bytes = attachment.get('contentBytes')
+                if content_bytes:
+                    # Save attachment to file, creating dirs if missing.
+                    data = base64.b64decode(content_bytes)
+                    ensure_dir_for(path)
+                    with open(path, 'wb') as output_file:
+                        output_file.write(data)
+                        logger.info('%s saved to %s', attachment_name, path)
+                    # Save data to archive list
+                    archive.append({
+                        'message_id': message_id,
+                        'attachment_name': attachment_name,
+                        'saved': path,
+                    })
+
+    # Save archive to file.
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, 'w') as archive_file:
+        json.dump(archive, archive_file)
+
+def argument_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config')
+    parser.add_argument('--debug')
+    return parser
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
+
+    cp = ConfigParser()
+    cp.read(args.config)
+
+    if set(['loggers', 'handlers', 'formatters']).issubset(cp):
+        logging.config.fileConfig(cp, disable_existing_loggers=False)
+
+    try:
+        realmain(cp)
+    except:
+        logger.exception('An exception occurred.')
 
 if __name__ == '__main__':
     main()
