@@ -6,12 +6,12 @@ import os
 import os
 import sys
 
+from configparser import ConfigParser
 from pprint import pprint
 
 import msal
 import requests
 
-from configparser import ConfigParser
 from msal import ConfidentialClientApplication
 from schema import GraphMessageSchema
 
@@ -129,6 +129,7 @@ def load_module_from_path(path, module_name = None):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('config')
+    parser.add_argument('--debug')
     args = parser.parse_args(argv)
 
     cp = ConfigParser()
@@ -149,6 +150,8 @@ def main(argv=None):
         client_credential = client_secret
     )
 
+    message_schema = GraphMessageSchema()
+
     result = app.acquire_token_for_client(scopes=scope)
     if "access_token" not in result:
         raise Exception(f"Failed to get token: {result.get('error_description')}")
@@ -158,7 +161,11 @@ def main(argv=None):
     headers = {"Authorization": f"Bearer {token}"}
     url = f"https://graph.microsoft.com/v1.0/users/{mailbox}/mailFolders('Inbox')/messages"
     resp = requests.get(url, headers=headers)
-    pprint(resp.json())
+    messages = resp.json()
+    for message in messages['value']:
+        message = message_schema.load(message)
+        pprint(message)
+    breakpoint()
 
 if __name__ == '__main__':
     main()
