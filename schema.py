@@ -1,6 +1,12 @@
+import logging
+
+from datetime import datetime
+from datetime import timezone
+
 import marshmallow
 
 from marshmallow import Schema
+from marshmallow import post_load
 from marshmallow.fields import Boolean
 from marshmallow.fields import DateTime
 from marshmallow.fields import Field
@@ -9,75 +15,120 @@ from marshmallow.fields import List
 from marshmallow.fields import Nested
 from marshmallow.fields import String
 
+logger = logging.getLogger(__name__)
 
-class EmailAddressSchema(Schema):
+class SafeDateTime(Field):
 
-    address = String()
-    name = String()
+    def __init__(self, fmt, timezone=False, **kwargs):
+        self.fmt = fmt
+        self.timezone = timezone
+        super().__init__(**kwargs)
 
-
-class SenderSchema(Schema):
-
-    email_address = Nested(EmailAddressSchema, data_key='emailAddress')
-
-
-class RecipientSchema(Schema):
-
-    email_address = Nested(EmailAddressSchema, data_key='emailAddress')
-
-
-class BodySchema(Schema):
-
-    content = String()
-    content_type = String(data_key='contentType')
-
-
-class Base64ContentField(Field):
-    """
-    A string (not bytes) of base64 encoded "bytes".
-    https://learn.microsoft.com/en-us/graph/api/resources/fileattachment?view=graph-rest-1.0#properties
-    See contentBytes
-    """
-
-    def _deserialize(self, string_of_bytes, attr, data, **kwargs):
+    def _deserialize(self, value, attr, data, **kwargs):
+        if not value:
+            return None
         try:
-            return base64.b64decode(string_of_bytes)
-        except TypeError:
-            raise ValidationError(
-                'Base 64 content field must be string or bytes.')
+            result = datetime.strptime(value, self.fmt)
+            if self.timezone:
+                result = result.replace(tzinfo=self.timezone)
+            return result
+        except (ValueError, TypeError):
+            logger.debug('failed %s with %s', value, self.fmt)
 
 
-class AttachmentSchema(Schema):
+class SeparatedInteger(Field):
 
-    content_type = String(data_key='contentType')
-    content = Base64ContentField(data_key='contentBytes')
-    id = String()
-    is_inline = Boolean(data_key='isInline')
-    last_modified_datetime = DateTime(data_key='lastModifiedDateTime')
-    name = String()
-    size = Integer()
+    def __init__(self, separator, index, **kwargs):
+        super().__init__(**kwargs)
+        self.separator = separator
+        self.index = index
 
-    @marshmallow.post_load
-    def make_expected(self, data, **kwargs):
-        class Payload:
-
-            def __init__(self, content):
-                self.payload = content
+    def _deserialize(self, value, attr, data, **kwargs):
+        if not value:
+            return None
+        values = value.split(self.separator)
+        return int(values[self.index])
 
 
-        expected = Payload(data['content'])
-        return expected
+WGL_DATETIME_FORMAT = '%a, %b %d, %Y %H:%M:%S'
 
+class WGLAircraftDownloadReportSchema(Schema):
 
-class GraphMessageSchema(Schema):
+    registration = String(data_key='Registration')
 
-    sender = Nested(EmailAddressSchema)
-    toRecipients = Nested(RecipientSchema, many=True)
-    subject = String()
-    received_datetime = DateTime(data_key='receivedDateTime')
-    body = Nested(BodySchema)
+    wqar_serial = String(data_key='WQAR Serial Number')
 
-    attachments = List(
-        Nested(AttachmentSchema)
+    last_download_complete_at = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last complete download at',
+        timezone = timezone.utc,
     )
 
+    last_download_file = String(data_key='Last download file')
+
+    last_download_file_size = String(
+        data_key = 'Last downloaded file size',
+    )
+
+    last_activity = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last activity',
+        timezone = timezone.utc,
+    )
+
+    hours_since_last_complete_download = String(
+        data_key = 'Hours since last complete download',
+    )
+
+    successful_downloads = Integer(data_key='Successful downloads')
+
+    unsuccessful_downloads = Integer(data_key='Unsuccessful downloads')
+
+    @post_load
+    def remove_hours_since_last_complete_download(self, data, **kwargs):
+        data.pop('hours_since_last_complete_download', None)
+        return data
+
+
+class WGLDataLoadingSchema(Schema):
+
+    registration = String(data_key='Registration')
+
+    wqar_serial = String(data_key='WQAR Serial Number')
+
+    last_complete_eadl_status_file_download_at = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last completed eADL STATUS file download at',
+        timezone = timezone.utc,
+    )
+
+    last_complete_eadl_event_log_file_download_at = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last completed eADL EVENT LOG file download at',
+        timezone = timezone.utc,
+    )
+
+    last_complete_ptman_file_upload_at = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last completed PTMAN file upload at',
+        timezone = timezone.utc,
+    )
+
+    last_complete_lsp_upload_at = SafeDateTime(
+        fmt = WGL_DATETIME_FORMAT,
+        data_key = 'Last completed LSP upload at',
+        timezone = timezone.utc,
+    )
+
+    successful_uploads_ptman_lsp = String(
+        data_key = 'Successful uploads (PTMAN/LSP)',
+    )
+
+    @post_load
+    def split_successful_uploads(self, data, **kwargs):
+        combined = data.pop('successful_uploads_ptman_lsp', None)
+        if combined:
+            lsp, ptman = map(int, combined.split('/'))
+            data['successful_uploads_ptman'] = ptman
+            data['successful_uploads_lsp'] = lsp
+        return data

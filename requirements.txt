@@ -1,3 +1,5 @@
+beautifulsoup4
 marshmallow
 msal
 requests
+sqlalchemy
